@@ -6,40 +6,40 @@ from pathlib import Path
 
 from curl_cffi.requests import AsyncSession
 
-BASE_URL = "https://www.myhome.ge/_next/data/amMEKQzjIvb_mJwpn39oA/ka/s/yvela-gancxadeba.json"
+API_BASE = "https://api-statements.tnet.ge/v1/statements"
+COUNT_URL = f"{API_BASE}/count"
 
 HEADERS = {
-    "accept": "*/*",
+    "X-Website-Key": "myhome",
+    "Accept": "application/json",
     "accept-encoding": "gzip, deflate, br, zstd",
-    "accept-language": "en-GB,en-US;q=0.9,en;q=0.8,ru;q=0.7,az;q=0.6",
-    "dnt": "1",
+    "accept-language": "en-GB,en-US;q=0.9,en;q=0.8",
     "referer": "https://www.myhome.ge/",
-    "sec-ch-ua": '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-    "x-nextjs-data": "1",
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/145.0.0.0 Safari/537.36"
+    ),
 }
 
 PARAMS_BASE = {
     "currency_id": "1",
-    "CardView": "1",
-    "slug": "yvela-gancxadeba",
+    "locale": "ka",
 }
 
+CONCURRENCY = 10  # parallel requests
 OUTPUT_FILE = Path(__file__).parent.parent / "data" / "data.csv"
 
 
 def flatten_listing(item: dict) -> dict:
-    """Flatten a listing dict into a flat row for CSV."""
     row = {}
     for key, value in item.items():
         if isinstance(value, dict):
             for sub_key, sub_value in value.items():
-                row[f"{key}_{sub_key}"] = sub_value
+                if isinstance(sub_value, (dict, list)):
+                    row[f"{key}_{sub_key}"] = json.dumps(sub_value, ensure_ascii=False)
+                else:
+                    row[f"{key}_{sub_key}"] = sub_value
         elif isinstance(value, list):
             row[key] = json.dumps(value, ensure_ascii=False)
         else:
@@ -47,70 +47,34 @@ def flatten_listing(item: dict) -> dict:
     return row
 
 
-async def fetch_page(session: AsyncSession, page: int) -> dict:
+async def get_total_pages(session: AsyncSession) -> tuple[int, int]:
+    r = await session.get(COUNT_URL, headers=HEADERS, params=PARAMS_BASE)
+    r.raise_for_status()
+    d = r.json()["data"]
+    return d["last_page"], d["total"]
+
+
+async def fetch_page(session: AsyncSession, page: int) -> list[dict]:
     params = {**PARAMS_BASE, "page": str(page)}
-    response = await session.get(BASE_URL, headers=HEADERS, params=params)
-    response.raise_for_status()
-    return response.json()
-
-
-def extract_listings(data: dict) -> list[dict]:
-    """Navigate the Next.js data structure to extract listings."""
-    try:
-        page_props = data["pageProps"]
-        # Try common paths in Next.js data
-        for key in ("data", "listings", "items", "cards"):
-            if key in page_props and isinstance(page_props[key], list):
-                return page_props[key]
-        # Fallback: search one level deeper
-        for value in page_props.values():
-            if isinstance(value, dict):
-                for key in ("data", "listings", "items", "cards"):
-                    if key in value and isinstance(value[key], list):
-                        return value[key]
-        return []
-    except (KeyError, TypeError):
-        return []
-
-
-def extract_total_pages(data: dict) -> int:
-    """Extract total page count from response."""
-    try:
-        page_props = data["pageProps"]
-        for key in ("last_page", "totalPages", "total_pages", "pageCount"):
-            if key in page_props:
-                return int(page_props[key])
-        for value in page_props.values():
-            if isinstance(value, dict):
-                for key in ("last_page", "totalPages", "total_pages", "pageCount"):
-                    if key in value:
-                        return int(value[key])
-        return 1
-    except (KeyError, TypeError, ValueError):
-        return 1
+    r = await session.get(API_BASE, headers=HEADERS, params=params)
+    r.raise_for_status()
+    return r.json()["data"]["data"]
 
 
 async def scrape(max_pages: int | None = None) -> None:
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     async with AsyncSession(impersonate="chrome110") as session:
-        # Fetch first page to discover total pages and fieldnames
-        print("Fetching page 1 ...", flush=True)
-        first_data = await fetch_page(session, 1)
-        total_pages = extract_total_pages(first_data)
-        listings = extract_listings(first_data)
-
-        if not listings:
-            print("No listings found in response. Dumping raw structure for inspection:")
-            print(json.dumps(first_data, indent=2, ensure_ascii=False)[:3000])
-            sys.exit(1)
-
+        last_page, total = await get_total_pages(session)
         if max_pages is not None:
-            total_pages = min(total_pages, max_pages)
+            last_page = min(last_page, max_pages)
 
-        print(f"Total pages to scrape: {total_pages}", flush=True)
+        print(f"Total listings: {total:,} | Pages to scrape: {last_page:,}", flush=True)
 
-        rows = [flatten_listing(item) for item in listings]
+        # Fetch page 1 to establish fieldnames
+        print("Fetching page 1 ...", flush=True)
+        first_listings = await fetch_page(session, 1)
+        rows = [flatten_listing(item) for item in first_listings]
         fieldnames = list(rows[0].keys()) if rows else []
 
         with OUTPUT_FILE.open("w", newline="", encoding="utf-8") as f:
@@ -118,20 +82,30 @@ async def scrape(max_pages: int | None = None) -> None:
             writer.writeheader()
             writer.writerows(rows)
 
-        # Fetch remaining pages
-        for page in range(2, total_pages + 1):
-            print(f"Fetching page {page}/{total_pages} ...", flush=True)
-            try:
-                data = await fetch_page(session, page)
-                page_listings = extract_listings(data)
-                page_rows = [flatten_listing(item) for item in page_listings]
-                with OUTPUT_FILE.open("a", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-                    writer.writerows(page_rows)
-            except Exception as exc:
-                print(f"Error on page {page}: {exc}", flush=True)
+        # Fetch remaining pages with bounded concurrency
+        sem = asyncio.Semaphore(CONCURRENCY)
+        completed = 1
 
-    print(f"Done. Data saved to {OUTPUT_FILE}", flush=True)
+        async def fetch_and_write(page: int) -> None:
+            nonlocal completed
+            async with sem:
+                try:
+                    listings = await fetch_page(session, page)
+                    page_rows = [flatten_listing(item) for item in listings]
+                    # Append (file lock not needed: GIL covers single-writer pattern)
+                    with OUTPUT_FILE.open("a", newline="", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                        writer.writerows(page_rows)
+                    completed += 1
+                    if completed % 100 == 0:
+                        print(f"  {completed}/{last_page} pages done", flush=True)
+                except Exception as exc:
+                    print(f"  [WARN] page {page} failed: {exc}", flush=True)
+
+        tasks = [fetch_and_write(p) for p in range(2, last_page + 1)]
+        await asyncio.gather(*tasks)
+
+    print(f"\nDone. {completed} pages scraped -> {OUTPUT_FILE}", flush=True)
 
 
 if __name__ == "__main__":
